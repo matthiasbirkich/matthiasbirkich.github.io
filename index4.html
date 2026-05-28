@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ReefCube BLE Logger Android A000 v42</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color-scheme: light dark; }
+    body { margin: 0; padding: 16px; max-width: 980px; margin-inline: auto; }
+    h1 { font-size: 1.35rem; margin: 0 0 8px; }
+    .small { font-size: .88rem; opacity: .76; }
+    .status { padding: 10px 12px; border-radius: 10px; background: rgba(127,127,127,.15); margin: 10px 0 14px; white-space: pre-wrap; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; align-items: center; }
+    button, input, select { font-size: 1rem; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(127,127,127,.45); }
+    button { cursor: pointer; font-weight: 650; }
+    button.primary { background: #1f7aec; color: white; border-color: #1f7aec; }
+    button.warn { background: #b00020; color: white; border-color: #b00020; }
+    input { flex: 1 1 280px; min-width: 0; }
+    label { display: flex; align-items: center; gap: 6px; }
+    textarea { width: 100%; height: 48vh; box-sizing: border-box; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9rem; padding: 10px; border-radius: 10px; border: 1px solid rgba(127,127,127,.45); white-space: pre; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 10px 0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <h1>ReefCube BLE Logger Android A000 v42</h1>
+  <div class="small">Android compatibility client for UW52840-A00042. Uses legacy A000/A001/A002 BLE service via Chrome on Android over HTTPS.</div>
+
+  <div id="status" class="status">Not connected.</div>
+
+  <div class="row">
+    <button id="connect" class="primary">Connect Logger</button>
+    <button id="disconnect">Disconnect</button>
+    <button id="clear">Clear console</button>
+    <button id="saveCsv">Save / Share CSV</button>
+    <button id="saveTxt">Save / Share TXT</button>
+  </div>
+
+  <div class="row small">
+    <label>Write mode:
+      <select id="writeMode">
+        <option value="without" selected>Without response (recommended for NUS)</option>
+        <option value="with">With response</option>
+        <option value="auto">Auto fallback</option>
+      </select>
+    </label>
+    <label><input id="echoSent" type="checkbox" checked> Show sent commands</label>
+    <label><input id="showRaw" type="checkbox"> Show raw notification chunks</label>
+  </div>
+
+  <div class="grid">
+    <button data-cmd="STATUS">Status</button>
+    <button data-cmd="COUNT">Count</button>
+    <button data-cmd="GETCSV 10">Last 10 CSV</button>
+    <button data-cmd="GETCSV 100">Last 100 CSV</button>
+    <button data-cmd="GETCSV">All CSV</button>
+    <button data-cmd="MEAS">Measure now</button>
+    <button data-cmd="GET_TIME">Time</button>
+    <button data-cmd="RTC_DUMP">RTC dump</button>
+    <button data-cmd="SETINT 1800">Set 30 min</button>
+    <button data-cmd="SETINT 3600">Set 60 min</button>
+    <button data-cmd="LED_ON">LED on</button>
+    <button data-cmd="LED_OFF">LED off</button>
+    <button data-cmd="BLEOFF" class="warn">BLE off</button>
+  </div>
+
+  <div class="row">
+    <input id="customCmd" placeholder="Custom command, e.g. SETTIME 2026-05-26T16:55:00">
+    <button id="sendCustom">Send</button>
+  </div>
+
+  <textarea id="console" readonly spellcheck="false"></textarea>
+
+<script>
+(() => {
+  const NUS_SERVICE = '0000a000-0000-1000-8000-00805f9b34fb';
+  const NUS_RX = '0000a001-0000-1000-8000-00805f9b34fb'; // browser -> logger, legacy Command
+  const NUS_TX = '0000a002-0000-1000-8000-00805f9b34fb'; // logger -> browser, legacy Status/CSV
+
+  let device = null;
+  let server = null;
+  let rxChar = null;
+  let txChar = null;
+  let receiveBuffer = '';
+  let capture = '';
+
+  const enc = new TextEncoder();
+  const dec = new TextDecoder('utf-8');
+  const statusEl = document.getElementById('status');
+  const consoleEl = document.getElementById('console');
+  const writeModeEl = document.getElementById('writeMode');
+  const echoSentEl = document.getElementById('echoSent');
+  const showRawEl = document.getElementById('showRaw');
+
+  function setStatus(msg) { statusEl.textContent = msg; }
+  function append(text) {
+    capture += text;
+    consoleEl.value += text;
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+  function appendLine(line) { append(line + '\n'); }
+  function appendSystem(line) { appendLine('# ' + line); }
+
+  function propsToString(ch) {
+    const p = ch.properties;
+    const a = [];
+    if (p.read) a.push('read');
+    if (p.write) a.push('write');
+    if (p.writeWithoutResponse) a.push('writeWithoutResponse');
+    if (p.notify) a.push('notify');
+    if (p.indicate) a.push('indicate');
+    return a.join(', ') || 'no-properties';
+  }
+
+  function onDisconnected() {
+    setStatus('Disconnected.');
+    appendSystem('Disconnected.');
+    rxChar = null; txChar = null; server = null;
+  }
+
+  async function connect() {
+    if (!('bluetooth' in navigator)) {
+      alert('Web Bluetooth is not available in this browser. Use Chrome on Android.');
+      return;
+    }
+    setStatus('Opening Bluetooth chooser...');
+    appendSystem('Opening Bluetooth chooser...');
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'UW52840' }],
+      optionalServices: [NUS_SERVICE]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    setStatus('Connecting to ' + (device.name || 'device') + '...');
+    appendSystem('Selected: ' + (device.name || '(no name)') + ', id=' + (device.id || '(no id)'));
+
+    server = await device.gatt.connect();
+    appendSystem('GATT connected. Getting legacy A000 logger service...');
+
+    const service = await server.getPrimaryService(NUS_SERVICE);
+    rxChar = await service.getCharacteristic(NUS_RX);
+    txChar = await service.getCharacteristic(NUS_TX);
+
+    appendSystem('A001 properties: ' + propsToString(rxChar));
+    appendSystem('A002 properties: ' + propsToString(txChar));
+
+    txChar.addEventListener('characteristicvaluechanged', handleNotification);
+    await txChar.startNotifications();
+
+    setStatus('Connected to ' + (device.name || 'logger') + '. Notifications enabled.');
+    appendSystem('Notifications enabled on A002. Ready.');
+  }
+
+  async function disconnect() {
+    if (device && device.gatt && device.gatt.connected) device.gatt.disconnect();
+    else onDisconnected();
+  }
+
+  function handleNotification(event) {
+    const chunk = dec.decode(event.target.value);
+    if (showRawEl.checked) appendSystem('RX chunk: ' + JSON.stringify(chunk));
+    receiveBuffer += chunk;
+    // Firmware sends CR/LF after each complete logical line.
+    const parts = receiveBuffer.split(/\r?\n/);
+    receiveBuffer = parts.pop();
+    for (const line of parts) appendLine(line);
+  }
+
+  async function writeBytes(data) {
+    const mode = writeModeEl.value;
+    if (mode === 'without') {
+      if (!rxChar.writeValueWithoutResponse) throw new Error('writeValueWithoutResponse not supported by this browser.');
+      await rxChar.writeValueWithoutResponse(data);
+      return 'without response';
+    }
+    if (mode === 'with') {
+      if (!rxChar.writeValueWithResponse) throw new Error('writeValueWithResponse not supported by this browser.');
+      await rxChar.writeValueWithResponse(data);
+      return 'with response';
+    }
+    // Auto fallback: try without-response first because Nordic UART is commonly used that way.
+    if (rxChar.writeValueWithoutResponse) {
+      try { await rxChar.writeValueWithoutResponse(data); return 'without response'; }
+      catch (e) { appendSystem('write without response failed: ' + e.message); }
+    }
+    if (rxChar.writeValueWithResponse) {
+      await rxChar.writeValueWithResponse(data);
+      return 'with response';
+    }
+    if (rxChar.writeValue) {
+      await rxChar.writeValue(data);
+      return 'legacy writeValue';
+    }
+    throw new Error('No write method available.');
+  }
+
+  async function sendCommand(cmd) {
+    if (!rxChar) {
+      alert('Not connected.');
+      return;
+    }
+    const line = cmd.trim();
+    if (!line) return;
+    const data = enc.encode(line + '\n');
+    setStatus('Sending: ' + line);
+    if (echoSentEl.checked) appendSystem('CMD: ' + line);
+    const usedMode = await writeBytes(data);
+    setStatus('Sent: ' + line + ' (' + usedMode + ')');
+    appendSystem('Sent using ' + usedMode + ': ' + line);
+  }
+
+  async function saveFile(ext) {
+    const text = capture || consoleEl.value || '';
+    if (!text.trim()) {
+      alert('Nothing to save: the console is empty.');
+      return;
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `ReefCube_${stamp}.${ext}`;
+    const mime = ext === 'csv' ? 'text/csv;charset=utf-8' : 'text/plain;charset=utf-8';
+    const blob = new Blob([text], { type: mime });
+    const file = new File([blob], filename, { type: mime });
+
+    // Best Android UX: open Android share sheet if supported.
+    try {
+      if (navigator.canShare && navigator.canShare({ files: [file] }) && navigator.share) {
+        await navigator.share({ files: [file], title: filename, text: 'ReefCube logger export' });
+        setStatus('Shared: ' + filename);
+        return;
+      }
+    } catch (e) {
+      appendSystem('Share failed: ' + e.message);
+    }
+
+    // Standard browser download fallback.
+    try {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      setStatus('Download started: ' + filename);
+      return;
+    } catch (e) {
+      appendSystem('Download failed: ' + e.message);
+    }
+
+    // Last fallback: copy to clipboard.
+    try {
+      await navigator.clipboard.writeText(text);
+      alert('File download failed, but the data was copied to the clipboard. Paste it into a text file and save it as .' + ext);
+      setStatus('Copied to clipboard.');
+    } catch (e) {
+      alert('Could not save or copy data: ' + e.message);
+      setStatus('Save error: ' + e.message);
+    }
+  }
+
+  document.getElementById('connect').addEventListener('click', () => connect().catch(e => { setStatus('Connect error: ' + e.message); appendSystem('Connect error: ' + e.message); }));
+  document.getElementById('disconnect').addEventListener('click', disconnect);
+  document.getElementById('clear').addEventListener('click', () => { capture = ''; consoleEl.value = ''; receiveBuffer = ''; appendSystem('Console cleared.'); });
+  document.getElementById('saveCsv').addEventListener('click', () => saveFile('csv'));
+  document.getElementById('saveTxt').addEventListener('click', () => saveFile('txt'));
+  document.getElementById('sendCustom').addEventListener('click', () => sendCommand(document.getElementById('customCmd').value).catch(e => { setStatus('Send error: ' + e.message); appendSystem('Send error: ' + e.message); }));
+  document.getElementById('customCmd').addEventListener('keydown', e => {
+    if (e.key === 'Enter') sendCommand(e.target.value).catch(err => { setStatus('Send error: ' + err.message); appendSystem('Send error: ' + err.message); });
+  });
+  document.querySelectorAll('button[data-cmd]').forEach(btn => {
+    btn.addEventListener('click', () => sendCommand(btn.dataset.cmd).catch(e => { setStatus('Send error: ' + e.message); appendSystem('Send error: ' + e.message); }));
+  });
+})();
+</script>
+</body>
+</html>
