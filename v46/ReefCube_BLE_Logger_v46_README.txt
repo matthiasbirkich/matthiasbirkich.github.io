@@ -17,8 +17,8 @@ SETUP
 1. Put ReefCube_BLE_Logger_v46_Chrome.html on an HTTPS website.
    Example: create a v46/ directory in your existing GitHub Pages repository
    and upload the file as v46/index.html. Do not overwrite the v41 page unless
-   you intend to replace it. The URL then is https://<username>.github.io/v46/
-   here: https://matthiasbirkich.github.io/v46/.
+   you intend to replace it. The URL then is https://<username>.github.io/v46
+   here: https://matthiasbirkich.github.io/v46
 2. Use Chrome on an Android phone or supported desktop Chromium browser with BLE.
    Standard Chrome on an iPad/iPhone does not support Web Bluetooth.
 3. Wake the logger using the reed magnet / reset as appropriate.
